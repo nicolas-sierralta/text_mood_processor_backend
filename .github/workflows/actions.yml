@@ -1,0 +1,413 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch: 
+    inputs:
+      deploy_mkdocs:  
+        description: 'Deploy MkDocs documentation?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+env:
+  GITHUB_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  build_test:
+    runs-on: self-hosted
+
+    strategy:
+      matrix:
+        service: [api_gateway, tone_analyzer_service, model_inference_service, change_tone_service]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.CR_PAT }}
+
+      # Crear archivos .env para cada servicio usando los secretos de GitHub
+      - name: Create .env file for each service
+        run: |
+          if [ "${{ matrix.service }}" == "api_gateway" ]; then
+            echo "TONE_ANALYZER_URL=${{ secrets.TONE_ANALYZER.URL }}" >> .env
+            echo "CHANGE_TONE_URL=${{ secrets.CHANGE_TONE_URL }}" >> .env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> .env
+            echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> .env
+          elif [ "${{ matrix.service }}" == "tone_analyzer_service" ]; then
+            echo "MODEL_INFERENCE_SERVICE_HOST=${{ secrets.MODEL_INFERENCE_SERVICE_HOST }}" >> .env
+            echo "MODEL_INFERENCE_SERVICE_PORT=${{ secrets.MODEL_INFERENCE_SERVICE_PORT }}" >> .env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> .env
+            echo "ENVIRONMENT=${{ secrets.MAX_TOKENS }}" >> .env
+          elif [ "${{ matrix.service }}" == "model_inference_service" ]; then
+            echo "MODEL_NAME=${{ secrets.MODEL_NAME }}" >> .env
+            echo "MAX_TOKENS=${{ secrets.MAX_TOKENS }}" >> .env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> .env
+            echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> .env
+            echo "DEBUG=True" >> .env
+          elif [ "${{ matrix.service }}" == "change_tone_service" ]; then  # Nuevo servicio
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
+            echo "OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}" >> .env
+            echo "MAX_TOKENS=${{ secrets.MAX_TOKENS }}" >> .env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> .env
+            echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> .env
+            echo "DEBUG=True" >> .env
+          fi
+
+      - name: Stop and remove ${{ matrix.service }} container if exists
+        run: |
+          if [ "$(docker ps -aq -f name=${{ matrix.service }}_container)" ]; then
+            echo "${{ matrix.service }}_container exists. Stopping and removing..."
+            docker stop ${{ matrix.service }}_container || true
+            docker rm ${{ matrix.service }}_container
+          else
+            echo "${{ matrix.service }}_container does not exist."
+          fi
+
+      - name: Build and push ${{ matrix.service }} Docker image
+        run: |
+          docker build --no-cache -t ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:latest ./${{ matrix.service }}
+          docker push ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:latest
+
+      # Run the container and check if the service is ready
+      - name: Run ${{ matrix.service }} container
+        run: |
+          if [ "${{ matrix.service }}" == "api_gateway" ]; then
+            docker run -d --name api_gateway_container \
+              --env-file .env \
+              -p 8000:8000 \
+              ghcr.io/${{ github.repository_owner }}/api_gateway:latest
+          elif [ "${{ matrix.service }}" == "tone_analyzer_service" ]; then
+            docker run -d --name tone_analyzer_service_container \
+              --env-file .env \
+              -p 8002:8002 \
+              ghcr.io/${{ github.repository_owner }}/tone_analyzer_service:latest
+          elif [ "${{ matrix.service }}" == "model_inference_service" ]; then
+            docker run -d --name model_inference_service_container \
+              --env-file .env \
+              -p 8001:8001 \
+              ghcr.io/${{ github.repository_owner }}/model_inference_service:latest
+          elif [ "${{ matrix.service }}" == "change_tone_service" ]; then  # Nuevo servicio
+            docker run -d --name change_tone_service_container \
+              --env-file .env \
+              -p 8003:8003 \
+              ghcr.io/${{ github.repository_owner }}/change_tone_service:latest
+          fi
+
+      # Wait for the service to be ready before running tests
+      - name: Wait for service to be ready
+        run: |
+          if [ "${{ matrix.service }}" == "api_gateway" ]; then
+            port=8000
+          elif [ "${{ matrix.service }}" == "tone_analyzer_service" ]; then
+            port=8002
+          elif [ "${{ matrix.service }}" == "model_inference_service" ]; then
+            port=8001
+          elif [ "${{ matrix.service }}" == "change_tone_service" ]; then  # Nuevo servicio
+            port=8003
+          fi
+          echo "Waiting for ${{ matrix.service }} to be ready..."
+          for i in {1..5}; do
+            if curl -s http://localhost:$port/health; then
+              echo "${{ matrix.service }} is ready"
+              break
+            else
+              echo "Waiting for ${{ matrix.service }} to be ready... Attempt $i"
+              sleep 10
+            fi
+            if [ $i -eq 5 ]; then
+              echo "Timeout: ${{ matrix.service }} is not ready"
+              exit 1
+            fi
+          done
+
+      # Run unit tests for each service
+      - name: Run unit tests for ${{ matrix.service }}
+        run: |
+          docker exec ${{ matrix.service }}_container pytest --maxfail=1 --disable-warnings
+
+      # Clean up unit test containers
+      - name: Clean up unit test containers
+        run: |
+          docker stop ${{ matrix.service }}_container
+          docker rm ${{ matrix.service }}_container
+
+  integration_test:
+    runs-on: self-hosted
+    needs: build_test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pytest requests
+          sudo apt-get update
+          sudo apt-get install -y docker-compose
+
+      # Crear archivos .env para la integración usando los secretos de GitHub
+      - name: Create .env files for integration tests
+        run: |
+          # Para api_gateway
+          echo "TONE_ANALYZER_URL=${{ secrets.TONE_ANALYZER_URL }}" > ./api_gateway/.env
+          echo "CHANGE_TONE_URL=${{ secrets.CHANGE_TONE_URL }}" >> ./api_gateway/.env
+          echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./api_gateway/.env
+          echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./api_gateway/.env
+
+          # Para tone_analyzer_service
+          echo "MODEL_INFERENCE_SERVICE_HOST=${{ secrets.MODEL_INFERENCE_SERVICE_HOST }}" > ./tone_analyzer_service/.env
+          echo "MODEL_INFERENCE_SERVICE_PORT=${{ secrets.MODEL_INFERENCE_SERVICE_PORT }}" >> ./tone_analyzer_service/.env
+          echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./tone_analyzer_service/.env
+          echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./tone_analyzer_service/.env
+
+          # Para model_inference_service
+          echo "MODEL_NAME=${{ secrets.MODEL_NAME }}" > ./model_inference_service/.env
+          echo "MAX_TOKENS=${{ secrets.MAX_TOKENS }}" >> ./model_inference_service/.env
+          echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./model_inference_service/.env
+          echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./model_inference_service/.env
+
+          # Para change_tone_service
+          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > ./change_tone_service/.env
+          echo "OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}" >> ./change_tone_service/.env
+          echo "MAX_TOKENS=${{ secrets.MAX_TOKENS }}" >> ./change_tone_service/.env
+          echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./change_tone_service/.env
+          echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./change_tone_service/.env
+          echo "DEBUG=True" >> ./change_tone_service/.env
+
+      # Run Docker Compose with the pushed images and the created .env files
+      - name: Run Docker Compose with pushed images
+        run: |
+          docker-compose -f docker-compose.production.yml up -d
+
+      # Wait for services to be ready
+      - name: Wait for services to be ready
+        run: |
+          services=( "8000" "8001" "8002" "8003" )  # Incluir el nuevo servicio aquí
+          for port in "${services[@]}"; do
+            for i in {1..5}; do
+              if curl -s http://localhost:$port/health; then
+                echo "Service on port $port is up and running"
+                break
+              else
+                echo "Waiting for service on port $port..."
+                sleep 60
+              fi
+              if [ $i -eq 5 ]; then
+                echo "Timeout: Service on port $port is not up after 5 attempts"
+                exit 1
+              fi
+            done
+          done
+
+      # Run integration tests
+      - name: Run integration tests
+        run: |
+          pytest tests/test_integration.py --maxfail=1 --disable-warnings
+
+      # Clean up Docker Compose and remove the .env files
+      - name: Clean up Docker Compose
+        run: |
+          docker-compose down
+
+  deploy:
+    runs-on: self-hosted
+    needs: integration_test
+
+    steps:
+      - name: Verify SSH connection to Scaleway
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            echo "SSH connection successful" || { echo "Failed to connect to the server" >&2; exit 1; }
+
+      # Clonar o actualizar el repositorio en Scaleway
+      - name: Clone or update repository on Scaleway
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            cd /root/projects/
+            if [ ! -d "text_mood_processor_backend" ]; then
+              git clone git@github.com:${{ github.repository }}.git
+              cd text_mood_processor_backend
+            else
+              cd text_mood_processor_backend
+              git pull
+            fi
+
+      - name: Create .env files on Scaleway
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            cd /root/projects/text_mood_processor_backend
+            
+            # Para api_gateway
+            echo "TONE_ANALYZER_URL=${{ secrets.TONE_ANALYZER_URL }}" > ./api_gateway/.env
+            echo "CHANGE_TONE_URL=${{ secrets.CHANGE_TONE_URL }}" >> ./api_gateway/.env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./api_gateway/.env
+            echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./api_gateway/.env
+            
+            # Para tone_analyzer_service
+            echo "MODEL_INFERENCE_SERVICE_HOST=${{ secrets.MODEL_INFERENCE_SERVICE_HOST }}" > ./tone_analyzer_service/.env
+            echo "MODEL_INFERENCE_SERVICE_PORT=${{ secrets.MODEL_INFERENCE_SERVICE_PORT }}" >> ./tone_analyzer_service/.env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./tone_analyzer_service/.env
+            echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./tone_analyzer_service/.env
+            
+            # Para model_inference_service
+            echo "MODEL_NAME=${{ secrets.MODEL_NAME }}" > ./model_inference_service/.env
+            echo "MAX_TOKENS=${{ secrets.MAX_TOKENS }}" >> ./model_inference_service/.env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./model_inference_service/.env
+            echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./model_inference_service/.env
+            
+            # Para change_tone_service
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > ./change_tone_service/.env
+            echo "OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}" >> ./change_tone_service/.env
+            echo "MAX_TOKENS=${{ secrets.MAX_TOKENS }}" >> ./change_tone_service/.env
+            echo "LOGGING_LEVEL=${{ secrets.LOGGING_LEVEL }}" >> ./change_tone_service/.env
+            echo "ENVIRONMENT=${{ secrets.ENVIRONMENT }}" >> ./change_tone_service/.env
+            echo "DEBUG=True" >> ./change_tone_service/.env
+
+
+      - name: Verify .env files existence
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            cd /root/projects/text_mood_processor_backend
+            if [ ! -f ./api_gateway/.env ]; then
+              echo "api_gateway/.env file missing!"
+              exit 1
+            fi
+            if [ ! -f ./tone_analyzer_service/.env ]; then
+              echo "tone_analyzer_service/.env file missing!"
+              exit 1
+            fi
+            if [ ! -f ./model_inference_service/.env ]; then
+              echo "model_inference_service/.env file missing!"
+              exit 1
+            fi
+            if [ ! -f ./change_tone_service/.env ]; then
+              echo "change_tone_service/.env file missing!"
+              exit 1
+            fi
+
+      - name: Wait before running docker-compose
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            sleep 5
+            cd /root/projects/text_mood_processor_backend
+            docker-compose down
+            docker-compose pull
+
+      - name: Start Docker services on Scaleway
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            cd /root/projects/text_mood_processor_backend
+            docker-compose up -d
+
+      - name: Verify Docker services are running on Scaleway
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            services=("8000" "8001" "8002" "8003")  # Incluir el nuevo servicio aquí
+            for port in "${services[@]}"; do
+              echo "Verifying service on port $port is up..."
+              for i in {1..5}; do
+                if curl -s http://localhost:$port/health; then
+                  echo "Service on port $port is up and running"
+                  break
+                else
+                  echo "Waiting for service on port $port... Attempt $i"
+                  sleep 10
+                fi
+                if [ $i -eq 5 ]; then
+                  echo "Timeout: Service on port $port is not up after 5 attempts"
+                  exit 1
+                fi
+              done
+            done
+
+      - name: Remove .env files from Scaleway
+        uses: appleboy/ssh-action@v0.1.3
+        with:
+          host: ${{ secrets.SCALEWAY_SERVER_IP }}
+          username: root
+          key: ${{ secrets.SCALEWAY_SSH_KEY }}
+          script: |
+            cd /root/projects/text_mood_processor_backend
+            echo "Removing .env files"
+            rm -f ./api_gateway/.env ./tone_analyzer_service/.env ./model_inference_service/.env ./change_tone_service/.env
+
+  mkdocs_deploy:
+    runs-on: ubuntu-latest
+    needs: integration_test 
+    permissions: 
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          pip install mkdocs mkdocs-material
+
+      - name: Deploy MkDocs to GitHub Pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  
+        run: |
+          mkdocs gh-deploy --force
+

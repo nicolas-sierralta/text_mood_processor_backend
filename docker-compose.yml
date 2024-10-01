@@ -1,0 +1,57 @@
+services:
+  api_gateway:
+    build:
+      context: ./api_gateway
+      dockerfile: Dockerfile
+    container_name: api_gateway
+    ports:
+      - "8000:8000"  # Map the host's port 8000 to the container's port 8000
+    depends_on:
+      - tone_analyzer_service
+      - change_tone_service
+    env_file: 
+      - ./api_gateway/.env  # Load environment variables for the API Gateway
+    networks:
+      - app-network
+
+  model_inference_service:
+    build:
+      context: ./model_inference_service
+      dockerfile: Dockerfile
+    container_name: model_inference_service
+    ports:
+      - "8001:8001"  # Map the host's port 8001 to the container's port 8001
+    env_file: 
+      - ./model_inference_service/.env  # Load environment variables for the Inference Service
+    networks:
+      - app-network
+
+  tone_analyzer_service:
+    build:
+      context: ./tone_analyzer_service
+      dockerfile: Dockerfile
+    container_name: tone_analyzer_service
+    depends_on:
+      - model_inference_service
+    ports:
+      - "8002:8002"  # Map the host's port 8002 to the container's port 8002
+    env_file: 
+      - ./tone_analyzer_service/.env  # Load environment variables for the Tone Analyzer Service
+    networks:
+      - app-network
+
+  change_tone_service:
+    build:
+      context: ./change_tone_service
+      dockerfile: Dockerfile
+    container_name: change_tone_service
+    ports:
+      - "8003:8003"  # Map the host's port 8003 to the container's port 8003
+    env_file:
+      - ./change_tone_service/.env  # Load environment variables for the Change Tone Service
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

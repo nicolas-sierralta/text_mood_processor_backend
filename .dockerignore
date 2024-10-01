@@ -1,0 +1,11 @@
+venv
+*.pyc
+__pycache__
+*.pyo
+*.pyd
+.DS_Store
+.env
+.pytest_cache
+.vscode/
+
+actions-runner

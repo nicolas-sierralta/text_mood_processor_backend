@@ -1,0 +1,50 @@
+services:
+  api_gateway:
+    image: ghcr.io/${GITHUB_OWNER}/api_gateway:latest  # Use the pushed image for the API Gateway
+    container_name: api_gateway
+    ports:
+      - "8000:8000"  # Map host port 8000 to container port 8000 for the API Gateway
+    depends_on:
+      - tone_analyzer_service  # Ensure the tone analyzer service starts before the API Gateway
+      - change_tone_service    # Add a dependency on the new change tone service
+    env_file: 
+      - ./api_gateway/.env  # Load environment variables from the API Gateway .env file
+    networks:
+      - app-network  # Connect the API Gateway to the shared network
+
+  model_inference_service:
+    image: ghcr.io/${GITHUB_OWNER}/model_inference_service:latest  # Use the pushed image for the inference service
+    container_name: model_inference_service
+    ports:
+      - "8001:8001"  # Map host port 8001 to container port 8001 for the inference service
+    env_file: 
+      - ./model_inference_service/.env  # Load environment variables from the Inference Service .env file
+    networks:
+      - app-network  # Connect the inference service to the shared network
+
+  tone_analyzer_service:
+    image: ghcr.io/${GITHUB_OWNER}/tone_analyzer_service:latest  # Use the pushed image for the tone analyzer service
+    container_name: tone_analyzer_service
+    depends_on:
+      - model_inference_service  # Ensure the inference service starts before the tone analyzer service
+    ports:
+      - "8002:8002"  # Map host port 8002 to container port 8002 for the tone analyzer service
+    env_file: 
+      - ./tone_analyzer_service/.env  # Load environment variables from the Tone Analyzer Service .env file
+    networks:
+      - app-network  # Connect the tone analyzer service to the shared network
+
+  change_tone_service:
+    image: ghcr.io/${GITHUB_OWNER}/change_tone_service:latest  # Use the pushed image for the change tone service
+    container_name: change_tone_service
+    ports:
+      - "8003:8003"  # Map host port 8003 to container port 8003 for the change tone service
+    env_file: 
+      - ./change_tone_service/.env  # Load environment variables from the Change Tone Service .env file
+    networks:
+      - app-network  # Connect the change tone service to the shared network
+
+networks:
+  app-network:
+    driver: bridge  # Use the bridge driver for container networking
+
